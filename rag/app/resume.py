@@ -608,29 +608,66 @@ def _fuse_text_blocks(meta_blocks: list[dict], ocr_blocks: list[dict]) -> list[d
     return fused
 
 
+def _detect_columns(x_centers: list[float], n_max: int = 4) -> list[float]:
+    """
+    Detect multi-column boundaries via gap clustering (aligned with SmartResume X-center clustering).
+
+    Algorithm: sort all block X-centers, find the largest gaps as column boundaries.
+    Supports 2~n_max columns. If the largest gap is insignificant (< 15% page width),
+    the layout is treated as single-column.
+
+    Args:
+        x_centers: list of X-center coordinates for all blocks
+        n_max: maximum number of columns supported
+    Returns:
+        column boundary X coordinates (ascending); empty list means single-column
+    """
+    if len(x_centers) < 6:
+        return []
+    xs = sorted(x_centers)
+    x_min, x_max = xs[0], xs[-1]
+    page_width = x_max - x_min
+    if page_width <= 0:
+        return []
+
+    # Compute gaps between adjacent X-centers
+    gaps = []
+    for i in range(1, len(xs)):
+        gaps.append((xs[i] - xs[i - 1], (xs[i - 1] + xs[i]) / 2))
+    # Sort gaps descending by size
+    gaps.sort(key=lambda g: g[0], reverse=True)
+
+    # Take the top n_max-1 gaps as candidate boundaries
+    boundaries = []
+    for gap_size, gap_mid in gaps[:n_max - 1]:
+        # Gap must be significant (> 15% page width) to be a valid boundary
+        if gap_size > page_width * 0.15:
+            boundaries.append(gap_mid)
+    boundaries.sort()
+    return boundaries
 
 
 def _layout_aware_reorder(blocks: list[dict]) -> list[dict]:
     """
-    Layout-aware hierarchical sorting (ref: SmartResume Hierarchical Re-ordering)
+    Heuristic layout-aware reordering (aligned with SmartResume Hierarchical Re-ordering).
 
-    Two-level sorting strategy:
-    1. Inter-segment sorting: first by page number, then by Y coordinate (top to bottom), same row by X coordinate (left to right)
-    2. Intra-segment sorting: within each logical segment, sort by reading order
-
-    For multi-column resumes, detect column positions by clustering X coordinates,
-    then sort by column order.
+    Sorting strategy:
+    1. Group by page
+    2. Detect multi-column layout per page via gap clustering (supports 2~4 columns)
+    3. Multi-column: sort by column order (left to right), within each column sort by Y
+       with row-height tolerance
+    4. Single-column: sort by Y with row-height tolerance
 
     Args:
-        blocks: Text block list (with coordinate info)
+        blocks: text block list (with coordinate info)
     Returns:
-        Sorted text block list
+        sorted text block list
     """
     if not blocks:
         return blocks
 
     # Group by page
-    pages = {}
+    pages: dict[int, list[dict]] = {}
     for b in blocks:
         pg = b.get("page", 0)
         pages.setdefault(pg, []).append(b)
@@ -639,32 +676,80 @@ def _layout_aware_reorder(blocks: list[dict]) -> list[dict]:
     for pg in sorted(pages.keys()):
         page_blocks = pages[pg]
 
-        # Detect multi-column layout: by X coordinate median
-        if len(page_blocks) > 5:
-            x_centers = [(b["x0"] + b["x1"]) / 2 for b in page_blocks]
-            x_min, x_max = min(x_centers), max(x_centers)
-            page_width = x_max - x_min if x_max > x_min else 1
+        # Compute row-height tolerance (for same-row detection)
+        if len(page_blocks) > 1:
+            heights = [b.get("bottom", 0) - b.get("top", 0) for b in page_blocks]
+            heights = [h for h in heights if h > 0]
+            row_thr = (sum(heights) / len(heights)) / 2 if heights else 8
+        else:
+            row_thr = 8
 
-            # Simple two-column detection: if text blocks are clearly distributed on left and right sides
-            mid_x = (x_min + x_max) / 2
-            left_count = sum(1 for x in x_centers if x < mid_x - page_width * 0.1)
-            right_count = sum(1 for x in x_centers if x > mid_x + page_width * 0.1)
+        # Detect columns via gap clustering
+        x_centers = [(b["x0"] + b["x1"]) / 2 for b in page_blocks]
+        boundaries = _detect_columns(x_centers)
 
-            if left_count > 3 and right_count > 3:
-                # Multi-column layout: left column first then right column, each column top to bottom
-                left_blocks = [b for b in page_blocks if (b["x0"] + b["x1"]) / 2 < mid_x]
-                right_blocks = [b for b in page_blocks if (b["x0"] + b["x1"]) / 2 >= mid_x]
-                left_blocks.sort(key=lambda b: (b["top"], b["x0"]))
-                right_blocks.sort(key=lambda b: (b["top"], b["x0"]))
-                sorted_blocks.extend(left_blocks)
-                sorted_blocks.extend(right_blocks)
-                continue
-
-        # Single-column layout: top to bottom, same row left to right
-        page_blocks.sort(key=lambda b: (b["top"], b["x0"]))
-        sorted_blocks.extend(page_blocks)
+        if boundaries:
+            # Multi-column layout: group by column, sort by Y within each column (with row-height tolerance)
+            col_edges = [float("-inf")] + boundaries + [float("inf")]
+            columns: list[list[dict]] = [[] for _ in range(len(col_edges) - 1)]
+            for b in page_blocks:
+                bx = (b["x0"] + b["x1"]) / 2
+                for ci in range(len(col_edges) - 1):
+                    if col_edges[ci] <= bx < col_edges[ci + 1]:
+                        columns[ci].append(b)
+                        break
+            for col in columns:
+                # Row-height tolerance sort: blocks within row_thr in Y are treated as same row, then sort by X
+                from functools import cmp_to_key
+                def _cmp(a, b, _thr=row_thr):
+                    dy = a.get("top", 0) - b.get("top", 0)
+                    if abs(dy) < _thr:
+                        return a.get("x0", 0) - b.get("x0", 0)
+                    return dy
+                col.sort(key=cmp_to_key(_cmp))
+                sorted_blocks.extend(col)
+        else:
+            # Single-column layout: row-height tolerance sort
+            from functools import cmp_to_key
+            def _cmp(a, b, _thr=row_thr):
+                dy = a.get("top", 0) - b.get("top", 0)
+                if abs(dy) < _thr:
+                    return a.get("x0", 0) - b.get("x0", 0)
+                return dy
+            page_blocks.sort(key=cmp_to_key(_cmp))
+            sorted_blocks.extend(page_blocks)
 
     return sorted_blocks
+
+
+def _overlapped_ratio(box: dict, region: dict) -> float:
+    """
+    Compute the overlap area ratio of box covered by region (one-directional IoU).
+
+    Aligned with SmartResume find_overlapped_with_threshold logic:
+    uses the ratio of box area covered by region to determine assignment.
+
+    Args:
+        box: text block with x0/top/x1/bottom
+        region: layout region with x0/top/x1/bottom
+    Returns:
+        overlap area / box area, range [0, 1]
+    """
+    bx0, btop, bx1, bbtm = box.get("x0", 0), box.get("top", 0), box.get("x1", 0), box.get("bottom", 0)
+    rx0, rtop, rx1, rbtm = region.get("x0", 0), region.get("top", 0), region.get("x1", 0), region.get("bottom", 0)
+    # No intersection
+    if bx1 <= rx0 or bx0 >= rx1 or bbtm <= rtop or btop >= rbtm:
+        return 0.0
+    # Intersection area
+    ix0 = max(bx0, rx0)
+    iy0 = max(btop, rtop)
+    ix1 = min(bx1, rx1)
+    iy1 = min(bbtm, rbtm)
+    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    box_area = (bx1 - bx0) * (bbtm - btop)
+    if box_area <= 0:
+        return 0.0
+    return inter / box_area
 
 
 def _build_indexed_text(blocks: list[dict]) -> tuple[str, list[str], list[dict]]:
@@ -2365,23 +2450,28 @@ def chunk(filename, binary, tenant_id, from_page=0, to_page=100000,
         callback(-1, f"Resume parsing failed: {str(e)}")
         return []
 
+def _build_layout_entries(layout_regions: list[dict]) -> list[dict]:
+    """
+    Build layout region index list (consistent with LayoutRecognizer.findLayout numbering).
 
-def _resort_page_with_layout(page_blocks: list[dict], layout_regions: list[dict]) -> list[dict]:
-    if not page_blocks:
-        return []
+    LayoutRecognizer iterates in fixed type order, numbering sequentially within each type
+    after sort_Y_firstly. Here we reuse the original order of layout_regions (already
+    processed by sort_Y_firstly + layouts_cleanup), grouping by type and numbering
+    sequentially to ensure keys match the existing layoutno on blocks.
 
-    if not layout_regions:
-        return sorted(page_blocks, key=lambda b: (
-            (b.get("top", 0) + b.get("bottom", 0)) / 2,
-            (b.get("x0", 0) + b.get("x1", 0)) / 2,
-        ))
-
-    type_groups: dict[str, list] = {}
+    Args:
+        layout_regions: layout region list
+    Returns:
+        index list with key/type/coordinates/center points
+    """
+    # Group by type, preserving original order
+    type_order: dict[str, list[dict]] = {}
     for lt in layout_regions:
         tp = lt.get("type", "")
-        type_groups.setdefault(tp, []).append(lt)
+        type_order.setdefault(tp, []).append(lt)
+
     entries = []
-    for tp, group in type_groups.items():
+    for tp, group in type_order.items():
         for idx, lt in enumerate(group):
             key = f"{tp}-{idx}"
             x0, x1 = lt.get("x0", 0), lt.get("x1", 0)
@@ -2391,19 +2481,20 @@ def _resort_page_with_layout(page_blocks: list[dict], layout_regions: list[dict]
                 "x0": x0, "top": top, "x1": x1, "bottom": bottom,
                 "cy": (top + bottom) / 2, "cx": (x0 + x1) / 2,
             })
+    return entries
 
-    for b in page_blocks:
-        if b.get("layoutno"):
-            continue
-        b_cx = (b.get("x0", 0) + b.get("x1", 0)) / 2
-        b_cy = (b.get("top", 0) + b.get("bottom", 0)) / 2
-        for entry in entries:
-            if (entry["x0"] <= b_cx <= entry["x1"]
-                    and entry["top"] <= b_cy <= entry["bottom"]):
-                b["layoutno"] = entry["key"]
-                b["layout_type"] = entry["type"]
-                break
 
+def _cleanup_sparse_regions(page_blocks: list[dict], entries: list[dict]):
+    """
+    Sparse layout region cleanup (text area ratio < 7.5% => unassign blocks).
+
+    Aligned with SmartResume: cleaned blocks have their layoutno cleared,
+    subsequent steps will re-assign them.
+
+    Args:
+        page_blocks: text block list (layoutno/layout_type modified in-place)
+        entries: layout region index list
+    """
     for entry in entries:
         layout_key = entry["key"]
         layout_area = (entry["x1"] - entry["x0"]) * (entry["bottom"] - entry["top"])
@@ -2421,66 +2512,134 @@ def _resort_page_with_layout(page_blocks: list[dict], layout_regions: list[dict]
                 b["layoutno"] = ""
                 b["layout_type"] = ""
 
-    entry_map = {e["key"]: e for e in entries}
-    for b in page_blocks:
-        b_cx = (b.get("x0", 0) + b.get("x1", 0)) / 2
-        b_cy = (b.get("top", 0) + b.get("bottom", 0)) / 2
-        b["_x_center"] = b_cx
-        b["_y_center"] = b_cy
-        layoutno = b.get("layoutno", "")
-        if layoutno and layoutno in entry_map:
-            b["_lx_center"] = entry_map[layoutno]["cx"]
-            b["_ly_center"] = entry_map[layoutno]["cy"]
-        else:
-            b["_lx_center"] = b_cx
-            b["_ly_center"] = b_cy
+def _estimate_row_threshold(blocks: list[dict]) -> float:
+    """
+    Estimate row-height tolerance (half line height) for same-row detection.
 
-    active_keys = {b.get("layoutno") for b in page_blocks if b.get("layoutno")}
-    active_entries = [e for e in entries if e["key"] in active_keys]
+    Aligned with SmartResume / Recognizer.sort_Y_firstly threshold parameter.
 
-    for b in page_blocks:
-        if b.get("layoutno"):
-            continue
-        if not active_entries:
-            continue
-        b_cx, b_cy = b["_x_center"], b["_y_center"]
-        min_dist = float("inf")
-        best_cx, best_cy = b_cx, b_cy
-        for ae in active_entries:
-            lx1, ly1, lx2, ly2 = ae["x0"], ae["top"], ae["x1"], ae["bottom"]
-            if b_cy < ly1:
-                dy = ly1 - b_cy
-            elif b_cy > ly2:
-                dy = b_cy - ly2
-            else:
-                dy = 0
-            if b_cx < lx1:
-                dx = lx1 - b_cx
-            elif b_cx > lx2:
-                dx = b_cx - lx2
-            else:
-                dx = 0
-            dist = (dx ** 2 + dy ** 2) ** 0.5
-            if dist < min_dist:
-                min_dist = dist
-                best_cx, best_cy = ae["cx"], ae["cy"]
-        b["_lx_center"] = best_cx
-        b["_ly_center"] = best_cy
+    Args:
+        blocks: text block list
+    Returns:
+        row-height tolerance value (pixels)
+    """
+    if not blocks:
+        return 8.0
+    heights = [b.get("bottom", 0) - b.get("top", 0) for b in blocks]
+    heights = [h for h in heights if h > 0]
+    if not heights:
+        return 8.0
+    return (sum(heights) / len(heights)) / 2
 
-    sorted_blocks = sorted(page_blocks, key=lambda b: (
-        b.get("_ly_center", 0),
-        b.get("_lx_center", 0),
-        b.get("_y_center", 0),
-        b.get("_x_center", 0),
-    ))
 
-    for b in sorted_blocks:
-        b.pop("_ly_center", None)
-        b.pop("_lx_center", None)
-        b.pop("_y_center", None)
-        b.pop("_x_center", None)
+def _layout_detect_reorder(blocks: list[dict], binary: bytes) -> list[dict]:
+    """
+    Per-page layout-aware reordering using YOLOv10 layout detection
+    (aligned with SmartResume per-page processing).
 
-    return sorted_blocks
+    Flow:
+    1. Group text blocks by page, render each page as image
+    2. Run LayoutRecognizer for layout detection + block tagging
+       - drop=True discards footer/reference noise regions (page numbers, etc.)
+       - In resume scenarios, headers may contain name/contact info; LayoutRecognizer's
+         internal keep_feats rules preserve headers below the top 10% of the page
+    3. Call _resort_page_with_layout per page for layout-aware sorting
+    4. Concatenate results in page order
+
+    Falls back to heuristic sorting on detection failure.
+
+    Args:
+        blocks: text block list (with coordinate info)
+        binary: PDF file binary content
+    Returns:
+        sorted text block list
+    """
+    if not blocks:
+        return blocks
+
+    recognizer = _get_layout_recognizer()
+    if recognizer is None:
+        logger.info("Layout detector unavailable, falling back to heuristic sorting")
+        return _layout_aware_reorder(blocks)
+
+    try:
+        import pdfplumber
+        # Group by page
+        pages_blocks: dict[int, list[dict]] = {}
+        for b in blocks:
+            pg = b.get("page", 0)
+            pages_blocks.setdefault(pg, []).append(b)
+
+        page_indices = sorted(pages_blocks.keys())
+        image_list = []
+        ocr_res_per_page = []
+
+        with pdfplumber.open(BytesIO(binary)) as pdf:
+            for pg in page_indices:
+                if pg >= len(pdf.pages):
+                    continue
+                page = pdf.pages[pg]
+                # Render as PIL image (scale_factor=3 matches LayoutRecognizer default)
+                pil_img = page.to_image(resolution=72 * 3).annotated
+                image_list.append(pil_img)
+
+                # Convert to LayoutRecognizer input format
+                page_bxs = []
+                for b in pages_blocks[pg]:
+                    page_bxs.append({
+                        "x0": float(b["x0"]),
+                        "top": float(b["top"]),
+                        "x1": float(b["x1"]),
+                        "bottom": float(b["bottom"]),
+                        "text": b["text"],
+                        "page": pg,
+                    })
+                ocr_res_per_page.append(page_bxs)
+
+        if not image_list:
+            return _layout_aware_reorder(blocks)
+
+        # Run LayoutRecognizer for layout detection + block tagging
+        # drop=True: discard footer/reference noise (aligned with SmartResume, page numbers etc. in resumes)
+        # LayoutRecognizer internal keep_feats preserves headers in the main page area (may contain name)
+        tagged_blocks, page_layouts = recognizer(
+            image_list, ocr_res_per_page, scale_factor=3, thr=0.2, drop=True
+        )
+
+        if not tagged_blocks:
+            logger.warning("Layout detection returned no results, falling back to heuristic sorting")
+            return _layout_aware_reorder(blocks)
+
+        # ---- Per-page sorting (aligned with SmartResume) ----
+        # Regroup tagged_blocks by page
+        tagged_per_page: dict[int, list[dict]] = {}
+        for b in tagged_blocks:
+            pg = b.get("page", 0)
+            tagged_per_page.setdefault(pg, []).append(b)
+
+        sorted_all = []
+        total_layout_count = 0
+        for pn, pg in enumerate(page_indices):
+            page_bxs = tagged_per_page.get(pg, [])
+            # page_layouts[pn] corresponds to layout regions for the pn-th image
+            lts = page_layouts[pn] if pn < len(page_layouts) else []
+            total_layout_count += len(lts)
+            # Per-page sorting
+            sorted_page = _resort_page_with_layout(page_bxs, lts)
+            sorted_all.extend(sorted_page)
+
+        # Ensure page field exists
+        for b in sorted_all:
+            if "page" not in b:
+                b["page"] = 0
+
+        logger.info(f"YOLOv10 layout detection complete (per-page sorting), {len(sorted_all)} text blocks, "
+                    f"{total_layout_count} layout regions detected")
+        return sorted_all
+
+    except Exception as e:
+        logger.warning(f"YOLOv10 layout detection sorting failed, falling back to heuristic sorting: {e}")
+        return _layout_aware_reorder(blocks)
 
 
 def _layout_detect_reorder(blocks: list[dict], binary: bytes) -> list[dict]:
